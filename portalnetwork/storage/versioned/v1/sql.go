@@ -6,7 +6,7 @@ type StoreType string
 
 const (
 	History StoreType = "history"
-	State StoreType = "state"
+	State   StoreType = "state"
 )
 
 func tableName(typ StoreType) string {
@@ -14,7 +14,7 @@ func tableName(typ StoreType) string {
 }
 
 func CreateTableSql(typ StoreType) string {
-	tableName := tableName(typ);
+	tableName := tableName(typ)
 	createTableSQL := fmt.Sprintf(`
         CREATE TABLE IF NOT EXISTS %s (
             content_id BLOB PRIMARY KEY,
@@ -26,11 +26,11 @@ func CreateTableSql(typ StoreType) string {
         CREATE INDEX IF NOT EXISTS %s_distance_short_idx ON %s (distance_short);
         CREATE INDEX IF NOT EXISTS %s_content_size_idx ON %s (content_size);
     `, tableName, tableName, tableName, tableName, tableName)
-		return createTableSQL;
+	return createTableSQL
 }
 
 func InsertSql(typ StoreType) string {
-	tableName := tableName(typ);
+	tableName := tableName(typ)
 	insertSql := fmt.Sprintf(`
 	INSERT OR IGNORE INTO %s (
             content_id,
@@ -45,7 +45,7 @@ func InsertSql(typ StoreType) string {
 }
 
 func DeleteSql(typ StoreType) string {
-	tableName := tableName(typ);
+	tableName := tableName(typ)
 	deleteSql := fmt.Sprintf(`
 	DELETE FROM %s
 	WHERE content_id = (?1)
@@ -55,19 +55,19 @@ func DeleteSql(typ StoreType) string {
 }
 
 func LookupKeySql(typ StoreType) string {
-	tableName := tableName(typ);
+	tableName := tableName(typ)
 	lookupKeySql := fmt.Sprintf("SELECT content_key FROM %s WHERE content_id = (?1) LIMIT 1", tableName)
 	return lookupKeySql
 }
 
 func LookupValueSql(typ StoreType) string {
-	tableName := tableName(typ);
+	tableName := tableName(typ)
 	lookupValueSql := fmt.Sprintf("SELECT content_value FROM %s WHERE content_id = (?1) LIMIT 1", tableName)
 	return lookupValueSql
 }
 
 func DeleteFarthestSql(typ StoreType) string {
-	tableName := tableName(typ);
+	tableName := tableName(typ)
 	// rowid is sqlite's default id
 	deleteFarthestSql := fmt.Sprintf(`
 	DELETE FROM %s
@@ -83,7 +83,7 @@ func DeleteFarthestSql(typ StoreType) string {
 }
 
 func LookupFarthestSql(typ StoreType) string {
-	tableName := tableName(typ);
+	tableName := tableName(typ)
 	// rowid is sqlite's default id
 	deleteFarthestSql := fmt.Sprintf(`
 	SELECT content_id, distance_short FROM %s
@@ -98,4 +98,3 @@ func EntryCountAndSizeSql(typ StoreType) string {
 	sql := fmt.Sprintf("SELECT COUNT(*) as count, TOTAL(content_size) as used_capacity FROM %s", tableName)
 	return sql
 }
-
