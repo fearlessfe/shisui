@@ -93,3 +93,7 @@ func TestBlockNumber(t *testing.T) {
 	u256Str := fmt.Sprint(u256Format)
 	require.Equal(t, u256Str, contentIdU256)
 }
+
+func TestHeadWithProof(t *testing.T) {
+	
+}
