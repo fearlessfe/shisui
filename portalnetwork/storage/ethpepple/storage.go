@@ -1,10 +1,11 @@
 package ethpepple
 
 import (
+	"bytes"
 	"encoding/binary"
 	"runtime"
+	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/bloom"
@@ -122,10 +123,9 @@ type ContentStorage struct {
 	radius                 atomic.Value
 	log                    log.Logger
 	db                     *pebble.DB
-	size                   uint64
-	sizeChan               chan struct{}
-	capacityChan           chan uint64
+	size                   atomic.Uint64
 	writeOptions           *pebble.WriteOptions
+	bytePool               sync.Pool
 }
 
 func NewPeppleStorage(config PeppleStorageConfig) (storage.ContentStorage, error) {
@@ -134,23 +134,15 @@ func NewPeppleStorage(config PeppleStorageConfig) (storage.ContentStorage, error
 		db:                     config.DB,
 		storageCapacityInBytes: config.StorageCapacityMB * 1000_000,
 		log:                    log.New("storage", config.NetworkName),
-		sizeChan:               make(chan struct{}, 1),
-		capacityChan:           make(chan uint64, 100),
 		writeOptions:           &pebble.WriteOptions{Sync: false},
+		bytePool: sync.Pool{
+			New: func() interface{} {
+				out := make([]byte, 8)
+				return &out
+			},
+		},
 	}
 	cs.radius.Store(storage.MaxDistance)
-	radius, _, err := cs.db.Get(storage.RadisuKey)
-	if err != nil && err != pebble.ErrNotFound {
-		return nil, err
-	}
-	if err == nil {
-		dis := uint256.NewInt(0)
-		err = dis.UnmarshalSSZ(radius)
-		if err != nil {
-			return nil, err
-		}
-		cs.radius.Store(dis)
-	}
 
 	val, _, err := cs.db.Get(storage.SizeKey)
 	if err != nil && err != pebble.ErrNotFound {
@@ -159,10 +151,23 @@ func NewPeppleStorage(config PeppleStorageConfig) (storage.ContentStorage, error
 	if err == nil {
 		size := binary.BigEndian.Uint64(val)
 		// init stage, no need to use lock
-		cs.size = size
+		cs.size.Store(size)
 	}
-	cs.sizeChan <- struct{}{}
-	go cs.saveCapacity()
+
+	iter, err := cs.db.NewIter(nil)
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+	if iter.Last() && iter.Valid() {
+		distance := iter.Key()
+		dis := uint256.NewInt(0)
+		err = dis.UnmarshalSSZ(distance)
+		if err != nil {
+			return nil, err
+		}
+		cs.radius.Store(dis)
+	}
 	return cs, nil
 }
 
@@ -182,19 +187,42 @@ func (c *ContentStorage) Get(contentKey []byte, contentId []byte) ([]byte, error
 
 // Put implements storage.ContentStorage.
 func (c *ContentStorage) Put(contentKey []byte, contentId []byte, content []byte) error {
+	distance := xor(contentId, c.nodeId[:])
+	valid, err := c.inRadius(distance)
+	if err != nil {
+		return err
+	}
+	if !valid {
+		return storage.ErrInsufficientRadius
+	}
 	length := uint64(len(contentId)) + uint64(len(content))
-	<-c.sizeChan
-	c.size += length
-	if c.size > c.storageCapacityInBytes {
+	newSize := c.size.Add(length)
+
+	buf := c.bytePool.Get().(*[]byte)
+	defer c.bytePool.Put(buf)
+	binary.BigEndian.PutUint64(*buf, newSize)
+	batch := c.db.NewBatch()
+
+	err = batch.Set(storage.SizeKey, *buf, c.writeOptions)
+	if err != nil {
+		return err
+	}
+	err = batch.Set(distance, content, c.writeOptions)
+	if err != nil {
+		return err
+	}
+	err = batch.Commit(c.writeOptions)
+	if err != nil {
+		return err
+	}
+
+	if newSize > c.storageCapacityInBytes {
 		err := c.prune()
 		if err != nil {
-			c.sizeChan <- struct{}{}
 			return err
 		}
 	}
-	c.sizeChan <- struct{}{}
-	distance := xor(contentId, c.nodeId[:])
-	return c.db.Set(distance, content, c.writeOptions)
+	return nil
 }
 
 // Radius implements storage.ContentStorage.
@@ -202,31 +230,6 @@ func (c *ContentStorage) Radius() *uint256.Int {
 	radius := c.radius.Load()
 	val := radius.(*uint256.Int)
 	return val
-}
-
-func (c *ContentStorage) saveCapacity() {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	capacityChanged := false
-	var currentCapacity uint64 = 0
-	buf := make([]byte, 8) // uint64
-
-	for {
-		select {
-		case <-ticker.C:
-			if capacityChanged {
-				binary.BigEndian.PutUint64(buf, currentCapacity)
-				err := c.db.Set(storage.SizeKey, buf, c.writeOptions)
-				if err != nil {
-					c.log.Error("save capacity failed", "error", err)
-				}
-				capacityChanged = false
-			}
-		case capacity := <-c.capacityChan:
-			capacityChanged = true
-			currentCapacity = capacity
-		}
-	}
 }
 
 func (c *ContentStorage) prune() error {
@@ -241,12 +244,14 @@ func (c *ContentStorage) prune() error {
 
 	batch := c.db.NewBatch()
 	for iter.Last(); iter.Valid(); iter.Prev() {
+		if bytes.Equal(iter.Key(), storage.SizeKey) {
+			continue
+		}
 		if curentSize < expectSize {
 			batch.Delete(iter.Key(), nil)
 			curentSize += uint64(len(iter.Key())) + uint64(len(iter.Value()))
 		} else {
 			distance := iter.Key()
-			c.db.Set(storage.RadisuKey, distance, c.writeOptions)
 			dis := uint256.NewInt(0)
 			err = dis.UnmarshalSSZ(distance)
 			if err != nil {
@@ -256,11 +261,27 @@ func (c *ContentStorage) prune() error {
 			break
 		}
 	}
+	newSize := c.size.Add(-curentSize)
+	buf := c.bytePool.Get().(*[]byte)
+	defer c.bytePool.Put(buf)
+	binary.BigEndian.PutUint64(*buf, newSize)
+	batch.Set(storage.SizeKey, *buf, c.writeOptions)
 	err = batch.Commit(&pebble.WriteOptions{Sync: true})
 	if err != nil {
 		return err
 	}
 	return nil
+}
+
+func (c *ContentStorage) inRadius(distance []byte) (bool, error) {
+	dis := uint256.NewInt(0)
+	err := dis.UnmarshalSSZ(distance)
+	if err != nil {
+		return false, err
+	}
+	val := c.radius.Load()
+	radius := val.(*uint256.Int)
+	return radius.Gt(dis), nil
 }
 
 func xor(contentId, nodeId []byte) []byte {
